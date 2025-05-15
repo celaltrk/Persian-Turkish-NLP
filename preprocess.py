@@ -13,22 +13,16 @@ from zemberek import (
 )
 from collections import Counter
 from pathlib import Path
-
+from functools import lru_cache
 
 logging.basicConfig(format='%(asctime)s : %(levelname)s : %(message)s', level=logging.INFO)
 
 # --- Configuration ---jpype.startJVM(jpype.getDefaultJVMPath(), "-Djava.class.path=/path/to/zemberek.jar")
 
 DATA_DIR = Path("./data")
-MODEL_OUTPUT_DIR = Path("./embedding_models")
+MODEL_OUTPUT_DIR = Path("./preprocessed")
 MODEL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-
-NUM_WORKERS = os.cpu_count() if os.cpu_count() else 4 # Use available CPU cores
-NUM_WORKERS = NUM_WORKERS - 3 # prevent excessive load
 MIN_WORD_COUNT = 5
-
-logging.info(f"Number of workers is {NUM_WORKERS}")
 
 # stopword list from https://github.com/ahmetax/trstop/blob/master/dosyalar/turkce-stop-words
 STOPWORDS = [
@@ -56,7 +50,21 @@ except Exception as e:
     logging.error(f"Failed to initialize Zemberek: {e}")
     morphology = normalizer = spell_checker = extractor = tokenizer = None
 
-def preprocess_turkish_text(text_lines):
+@lru_cache(maxsize=None)
+def get_longest_lemma(token):
+    results = morphology.analyze(token)
+    longest = ''
+    for result in results:
+        s = str(result)
+        if s.startswith('['):
+            lemma = s.split(']')[0].split(':')[0].lstrip('[')
+        else:
+            lemma = s.split(':')[0]
+        if len(lemma) > len(longest):
+            longest = lemma
+    return longest.lower()
+
+def preprocess_turkish_text(text_lines, decade_name="unknown"):
     processed_sentences = []
     vocab_counts = Counter()
 
@@ -65,46 +73,23 @@ def preprocess_turkish_text(text_lines):
             continue
         
         sentences = extractor.from_paragraph(line.strip())
-        unwanted_token_types = ['Punctuation', 'Emoticon', 'UnknownWord', 'Number', 'SpaceTab', 'NewLine', 'RomanNumeral', 'PercentNumeral', 'Time', 'Date', 'URL', 'Email', 'HashTag', 'Mention', 'MetaTag', 'Emoji', 'Emoticon', 'UnknownWord', 'Unknown']
+        unwanted_token_types = ['WordWithSymbol', 'Punctuation', 'Emoticon', 'UnknownWord', 'Number', 'SpaceTab', 'NewLine', 'RomanNumeral', 'PercentNumeral', 'Time', 'Date', 'URL', 'Email', 'HashTag', 'Mention', 'MetaTag', 'Emoji', 'Emoticon', 'UnknownWord', 'Unknown']
         for sentence in sentences:
-            # Tokenization
+            # Tokenize
             tokens = tokenizer.tokenize(sentence)
-            token_list = [token.content for token in tokens if token.type_.name not in unwanted_token_types and token.content.lower() not in STOPWORDS]
-            if not token_list:
+
+            # Filter unwanted types and stopwords
+            valid_tokens = [
+                token.content.lower() for token in tokens
+                if token.type_.name not in unwanted_token_types and token.content.lower() not in STOPWORDS and len(token.content) > 1
+            ]
+            if not valid_tokens:
                 continue
-            
-            normalized_text = normalizer.normalize(' '.join(token_list))
-            normalized_tokens = tokenizer.tokenize(normalized_text)
-            normalized_tokens = [token.content.lower() for token in normalized_tokens if token.type_.name not in unwanted_token_types and token.content.lower() not in STOPWORDS]
-            
-            # Spell correction
-            corrected_tokens = []
-            for token in normalized_tokens:
-                results = morphology.analyze(token)
-                if not results or len(str(results)) < 5:
-                    suggestions = spell_checker.suggest_for_word(token)
-                    token = suggestions[0] if suggestions else token
-                corrected_tokens.append(token)
 
             # Lemmatization
-            lemmatized_tokens = []
-            for token in corrected_tokens:
-                results = morphology.analyze(token)
-                largest_lemma = ''
-                largest_lemma_length = 0
-                for result in results:
-                    analysis_str = str(result)
-                    if analysis_str.startswith('['):
-                        lemma_section = analysis_str.split(']')[0]
-                        lemma = lemma_section.split(':')[0].lstrip('[')
-                    else:
-                        lemma = analysis_str.split(':')[0]
-                    if (len(lemma) > largest_lemma_length):
-                        largest_lemma = lemma
-                if largest_lemma:
-                    lemmatized_tokens.append(largest_lemma.lower())
+            lemmatized_tokens = [get_longest_lemma(t) for t in valid_tokens if get_longest_lemma(t)]
 
-            final_tokens = [token for token in lemmatized_tokens if token not in STOPWORDS]
+            final_tokens = [token for token in lemmatized_tokens if token not in STOPWORDS and len(token) > 1]
 
             # Update vocabulary counts
             if final_tokens:
@@ -120,7 +105,7 @@ def preprocess_turkish_text(text_lines):
             final_sentences.append(final_sentence)
 
     logging.info(f"Processed {len(final_sentences)} sentences with {len(shared_vocab)} unique words")
-    decade_name = 'test'
+    
     preprocessed_file_path = MODEL_OUTPUT_DIR / f"preprocessed_{decade_name}.txt"
     try:
         with open(preprocessed_file_path, 'w', encoding='utf-8') as f:
@@ -148,7 +133,7 @@ def preprocess_all_decade_files(decade_files):
             logging.warning(f"{file_path} is empty. Skipping.")
             continue
 
-        processed_sentences = preprocess_turkish_text(lines)
+        processed_sentences = preprocess_turkish_text(lines, decade_name)
 
         if not processed_sentences:
             logging.warning(f"No valid sentences found in {file_path}. Skipping save.")
@@ -171,7 +156,15 @@ if not DATA_DIR.is_dir():
     raise FileNotFoundError("Data directory not found")
 
 
-decade_files = sorted(DATA_DIR.glob("*.txt"))
+# parse command line arguments
+import argparse
+parser = argparse.ArgumentParser(description="Preprocess Turkish text files.")
+parser.add_argument('--decade', type=str, help="Decade to process (e.g., 1930s, 1940s, etc.)")
+args = parser.parse_args()
+if args.decade:
+    decade_files = sorted(DATA_DIR.glob(f"*{args.decade}.txt"))
+else:
+    decade_files = sorted(DATA_DIR.glob("*.txt"))
 
 if not decade_files:
     logging.warning(f"No .txt files found in {DATA_DIR}. Nothing to process.")
